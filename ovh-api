@@ -1,0 +1,157 @@
+#!/usr/bin/env racket
+#lang racket/base
+
+(require
+  racket/match
+  racket/string
+  racket/port
+  racket/format
+  racket/system
+  racket/cmdline
+  srfi/26
+  net/url
+  file/sha1
+  json)
+
+(define (url-append base-url url-string)
+  (define current-path (url-path base-url))
+  (define additional-url (string->url url-string))
+  (define additional-path (url-path additional-url))
+  (define new-path (append current-path additional-path))
+  (struct-copy url base-url [path new-path]
+                            [query (url-query additional-url)]
+                            [fragment (url-fragment additional-url)]))
+
+(define current-app-key (make-parameter (or (getenv "OVH_APP_KEY") "")))
+(define current-secret-key (make-parameter (or (getenv "OVH_SECRET_KEY") "")))
+(define current-consumer-key (make-parameter (or (getenv "OVH_CONSUMER_KEY") "")))
+
+(define base-url (string->url "https://eu.api.ovh.com/1.0"))
+(define credential-url (url-append base-url "/auth/credential"))
+(define timestamp-url (url-append base-url "/auth/time"))
+
+(define (base-headers)
+  (define headers
+    '([Accept . "application/json"]
+      [User-Agent . "Racket OVH Console"]))
+  (when (eq? (current-api-version) 'v7)
+    (set! headers (append headers '([X-Ovh-ApiVersion . "beta"]))))
+  (when (current-expand-mode)
+    (set! headers (append headers '([X-Ovh-ApiV7-Expand . 1]))))
+  headers)
+
+(define (get-consumer-key)
+  (define payload (jsexpr->bytes
+                    #hasheq([accessRules . #hasheq([method . "GET"]
+                                                   [path . "/*"])]
+                            [redirection . "https://api.ovh.com/console/"])))
+  (call/input-url
+    credential-url
+    (cut post-pure-port <> payload <>)
+    (lambda (in)
+      (let* ([response (port->string in)]
+             [result (hash-ref (string->jsexpr response) 'consumerKey #f)])
+        (or result response)))
+    (format-headers `([X-Ovh-Application . ,(current-app-key)]))))
+
+(define (call/get-string url [headers '()])
+  (call/input-url url get-pure-port
+    (lambda (in) (port->string in))
+    (format-headers headers)))
+
+(define (make-signature method query body timestamp)
+  (string-append
+    "$1$"
+    (sha1
+      (open-input-string
+        (string-join
+          (map ~a (list (current-secret-key)
+                        (current-consumer-key)
+                        method query body timestamp))
+          "+")))))
+
+(define get-timestamp #f)
+(define (make-timestamp-retriever)
+  (define server-time (string->number (call/get-string timestamp-url)))
+  (let ([time-delta (- server-time (current-seconds))])
+    (lambda ()
+      (+ (current-seconds) time-delta))))
+
+(define (authenticate method query body headers)
+  (define timestamp (get-timestamp))
+  (append headers
+          `([X-Ovh-Application . ,(current-app-key)]
+            [X-Ovh-Consumer . ,(current-consumer-key)]
+            [X-Ovh-Signature . ,(make-signature method query body timestamp)]
+            [X-Ovh-Timestamp . ,timestamp])))
+
+(define (format-headers headers)
+  (map (lambda (header)
+         (format "~a: ~a" (car header) (cdr header)))
+       headers))
+
+(define (pretty-headers headers)
+  (string-join (format-headers headers) "\n"))
+
+(define (format-params params)
+  (local-require net/uri-codec)
+  (string-append "?" (alist->form-urlencoded params)))
+
+(define (build-api-url url-string params)
+  (when (pair? params)
+    (set! url-string (string-append url-string (format-params params))))
+  (url-append base-url url-string))
+
+(define (ovh-api-get url headers)
+  (displayln (format "GET ~a~%~a~%" (url->string url) (pretty-headers headers)))
+  (displayln (call/get-string url headers)))
+
+(define (ovh-api-post url headers data)
+  'todo)
+
+(define (ovh-api-put url headers data)
+  'todo)
+
+(define (ovh-api-delete url headers)
+  'todo)
+
+(define (ovh-api-query verb url-string #:headers [headers '()]
+                                       #:data [data #f]
+                                       . params)
+  (when (not get-timestamp)
+    (set! get-timestamp (make-timestamp-retriever)))
+  (define url (build-api-url url-string params))
+  (define full-headers
+    (authenticate
+      verb
+      (url->string url)
+      (or data "")
+      (append (base-headers) headers)))
+  (match verb
+    ['GET (ovh-api-get url full-headers)]
+    ['POST (ovh-api-post url full-headers data)]
+    ['PUT (ovh-api-put url full-headers data)]
+    ['DELETE (ovh-api-delete url full-headers)]
+    [_ (raise-user-error 'unsupported-verb "~a" verb)]))
+
+(define current-expand-mode (make-parameter #f))
+(define current-api-version (make-parameter 'v6))
+(define current-params (make-parameter (make-hasheq)))
+(command-line
+  #:once-any
+  [("-R" "--refresh-consumer") "Ask for a new consumer key"
+                               (begin (displayln (get-consumer-key))
+                                      (exit))]
+  #:once-any
+  ["--v7" "Use APIv7" (current-api-version 'v7)]
+  ["--v6" "Use APIv6" (current-api-version 'v6)]
+  #:once-any
+  [("-e" "--expand") "Expand results (only with APIv7)"
+                     (current-expand-mode #t)]
+  #:multi
+  [("-a" "--arg") key value
+                  "Optional query argument"
+                  (hash-set! (current-params) (string->symbol key) value)]
+  #:args (method url)
+  (apply ovh-api-query (append (list (string->symbol (string-upcase method)) url)
+                               (hash->list (current-params)))))
