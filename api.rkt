@@ -1,30 +1,36 @@
-#!/usr/bin/env racket
 #lang racket/base
+
+(require
+  racket/contract/base)
+
+(define verb? (symbols 'GET 'POST 'PUT 'DELETE))
+(define alist? (listof (cons/c symbol? any/c)))
+
+(provide/contract
+  [current-api-version (parameter/c (symbols 'v6 'v7))]
+  [current-expand-mode (parameter/c boolean?)]
+  [get-consumer-key (-> string?)]
+  [ovh-api-query (->* (verb? string?) (#:headers alist?
+                                       #:data (or/c string? #f))
+                      #:rest alist?
+                      string?)])
 
 (require
   racket/match
   racket/string
   racket/port
   racket/format
-  racket/system
-  racket/cmdline
   srfi/26
   net/url
   file/sha1
-  json)
-
-(define (url-append base-url url-string)
-  (define current-path (url-path base-url))
-  (define additional-url (string->url url-string))
-  (define additional-path (url-path additional-url))
-  (define new-path (append current-path additional-path))
-  (struct-copy url base-url [path new-path]
-                            [query (url-query additional-url)]
-                            [fragment (url-fragment additional-url)]))
+  json
+  "url.rkt")
 
 (define current-app-key (make-parameter (or (getenv "OVH_APP_KEY") "")))
 (define current-secret-key (make-parameter (or (getenv "OVH_SECRET_KEY") "")))
 (define current-consumer-key (make-parameter (or (getenv "OVH_CONSUMER_KEY") "")))
+(define current-api-version (make-parameter 'v6))
+(define current-expand-mode (make-parameter #f))
 
 (define base-url (string->url "https://eu.api.ovh.com/1.0"))
 (define credential-url (url-append base-url "/auth/credential"))
@@ -52,7 +58,8 @@
       (let* ([response (port->string in)]
              [result (hash-ref (string->jsexpr response) 'consumerKey #f)])
         (or result response)))
-    (format-headers `([X-Ovh-Application . ,(current-app-key)]))))
+    (format-headers (append `([X-Ovh-Application . ,(current-app-key)])
+                            (base-headers)))))
 
 (define (call/get-string url [headers '()])
   (call/input-url url get-pure-port
@@ -85,26 +92,17 @@
             [X-Ovh-Signature . ,(make-signature method query body timestamp)]
             [X-Ovh-Timestamp . ,timestamp])))
 
-(define (format-headers headers)
-  (map (lambda (header)
-         (format "~a: ~a" (car header) (cdr header)))
-       headers))
-
-(define (pretty-headers headers)
-  (string-join (format-headers headers) "\n"))
-
-(define (format-params params)
-  (local-require net/uri-codec)
-  (string-append "?" (alist->form-urlencoded params)))
-
 (define (build-api-url url-string params)
   (when (pair? params)
     (set! url-string (string-append url-string (format-params params))))
   (url-append base-url url-string))
 
+(define (pretty-headers headers)
+  (string-join (format-headers headers) "\n"))
+
 (define (ovh-api-get url headers)
   (displayln (format "GET ~a~%~a~%" (url->string url) (pretty-headers headers)))
-  (displayln (call/get-string url headers)))
+  (call/get-string url headers))
 
 (define (ovh-api-post url headers data)
   'todo)
@@ -133,25 +131,3 @@
     ['PUT (ovh-api-put url full-headers data)]
     ['DELETE (ovh-api-delete url full-headers)]
     [_ (raise-user-error 'unsupported-verb "~a" verb)]))
-
-(define current-expand-mode (make-parameter #f))
-(define current-api-version (make-parameter 'v6))
-(define current-params (make-parameter (make-hasheq)))
-(command-line
-  #:once-any
-  [("-R" "--refresh-consumer") "Ask for a new consumer key"
-                               (begin (displayln (get-consumer-key))
-                                      (exit))]
-  #:once-any
-  ["--v7" "Use APIv7" (current-api-version 'v7)]
-  ["--v6" "Use APIv6" (current-api-version 'v6)]
-  #:once-any
-  [("-e" "--expand") "Expand results (only with APIv7)"
-                     (current-expand-mode #t)]
-  #:multi
-  [("-a" "--arg") key value
-                  "Optional query argument"
-                  (hash-set! (current-params) (string->symbol key) value)]
-  #:args (method url)
-  (apply ovh-api-query (append (list (string->symbol (string-upcase method)) url)
-                               (hash->list (current-params)))))
